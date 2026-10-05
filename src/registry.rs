@@ -73,6 +73,9 @@ pub fn all_providers(cfg: &Config, paths: &Paths) -> Vec<Box<dyn Provider>> {
                 found.push(Box::new(p.with_cache_dir(&paths.cache_dir)));
             }
         }
+        if let Some(p) = Claude::detect_omp(cfg, &paths.home.join(".omp/agent/agent.db")) {
+            found.push(Box::new(p.with_cache_dir(&paths.cache_dir)));
+        }
     }
     if cfg.openai.enabled {
         let openai = &cfg.openai;

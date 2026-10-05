@@ -201,10 +201,53 @@ struct SessionCache {
     session: Option<Session>,
 }
 
+/// Where a Claude card gets its OAuth token.
+enum Creds {
+    /// Claude Code config folder (`.credentials.json` or the macOS keychain).
+    ClaudeDir(PathBuf),
+    /// omp's credential database (`~/.omp/agent/agent.db`).
+    Omp(PathBuf),
+}
+
+impl Creds {
+    /// (access token, subscription type).
+    fn token(&self) -> Option<(Zeroizing<String>, Option<String>)> {
+        match self {
+            Self::ClaudeDir(dir) => parse_credentials(&read_credentials(dir)?),
+            Self::Omp(db) => read_omp_token(db).map(|token| (token, None)),
+        }
+    }
+}
+
+/// Access token of the newest enabled Anthropic OAuth login in omp's database. The
+/// database is opened read-only; omp refreshes the token, this app never does.
+pub fn read_omp_token(db: &Path) -> Option<Zeroizing<String>> {
+    use rusqlite::{Connection, OpenFlags};
+    if !db.is_file() {
+        return None;
+    }
+    // No `immutable`: omp writes this database in WAL mode while it runs.
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = Connection::open_with_flags(db, flags).ok()?;
+    let token: String = conn
+        .query_row(
+            "SELECT json_extract(data, '$.access') FROM auth_credentials \
+             WHERE provider = 'anthropic' AND credential_type = 'oauth' \
+             AND disabled_cause IS NULL ORDER BY updated_at DESC, id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .ok()?;
+    let token = Zeroizing::new(token);
+    (!token.trim().is_empty()).then(|| Zeroizing::new(token.trim().to_string()))
+}
+
 pub struct Claude {
     id: String,
     name: String,
-    claude_dir: PathBuf,
+    creds: Creds,
+    /// Claude Code folder whose `projects/` logs feed the session block.
+    sessions: Option<PathBuf>,
     api_base: String,
     limit_override: Option<u64>,
     interval: Duration,
@@ -219,14 +262,37 @@ impl Claude {
         if !cfg.claude.enabled {
             return None;
         }
-        let creds = read_credentials(&account.dir)?;
-        parse_credentials(&creds)?;
+        let creds = Creds::ClaudeDir(account.dir.clone());
+        creds.token()?;
         let (id, name) = account.identity("claude", "Claude");
+        Some(Self::new(cfg, id, name, creds, Some(account.dir.clone())))
+    }
+
+    /// The Claude subscription omp is logged in with, shown as "Claude · omp".
+    /// Hidden with `hide = ["omp"]` in `[claude]`.
+    pub fn detect_omp(cfg: &Config, db: &Path) -> Option<Self> {
+        if !cfg.claude.enabled || cfg.claude.hide.iter().any(|h| h == "omp") {
+            return None;
+        }
+        let creds = Creds::Omp(db.to_path_buf());
+        creds.token()?;
+        let (id, name) = Account::new("omp", db).identity("claude", "Claude");
+        Some(Self::new(cfg, id, name, creds, None))
+    }
+
+    fn new(
+        cfg: &Config,
+        id: String,
+        name: String,
+        creds: Creds,
+        sessions: Option<PathBuf>,
+    ) -> Self {
         let interval = cfg.claude.poll_interval();
-        Some(Self {
+        Self {
             id,
             name,
-            claude_dir: account.dir.clone(),
+            creds,
+            sessions,
             api_base: API_BASE.to_string(),
             limit_override: cfg.claude.context_limit,
             interval,
@@ -234,7 +300,7 @@ impl Claude {
             last_usage: None,
             usage_file: None,
             backoff: Backoff::new(interval),
-        })
+        }
     }
 
     pub fn with_api_base(mut self, base: impl Into<String>) -> Self {
@@ -296,7 +362,8 @@ impl Claude {
 
     /// Rescans the newest session log only when its path, size or mtime changed.
     fn current_session(&mut self) -> Option<Session> {
-        let newest = jsonl::newest_files(&self.claude_dir.join("projects"), "jsonl", 1).pop()?;
+        let dir = self.sessions.as_ref()?;
+        let newest = jsonl::newest_files(&dir.join("projects"), "jsonl", 1).pop()?;
         if let Some(cache) = &self.cache {
             if cache.file == newest {
                 return cache.session.clone();
@@ -341,8 +408,7 @@ impl Provider for Claude {
     }
 
     fn poll(&mut self) -> Result<ProviderSnapshot, ProviderError> {
-        let creds = read_credentials(&self.claude_dir).ok_or(ProviderError::NoCredentials)?;
-        let (token, plan) = parse_credentials(&creds).ok_or(ProviderError::NoCredentials)?;
+        let (token, plan) = self.creds.token().ok_or(ProviderError::NoCredentials)?;
         let now = SystemTime::now();
         let usage = self.usage(&token, now);
         // The session is local and always readable: keep it live while the API is down.
@@ -665,6 +731,34 @@ mod tests {
         let snap = p.poll().unwrap();
         assert!(snap.note.unwrap().contains("rate limited"));
         limited.assert_calls(1);
+    }
+
+    #[test]
+    fn omp_token_is_newest_enabled_anthropic_oauth() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("agent.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             CREATE TABLE auth_credentials (id INTEGER PRIMARY KEY, provider TEXT,
+               credential_type TEXT, data TEXT, disabled_cause TEXT, updated_at INTEGER);
+             INSERT INTO auth_credentials VALUES
+               (1, 'anthropic', 'oauth', '{\"access\":\"old\"}', NULL, 10),
+               (2, 'anthropic', 'oauth', '{\"access\":\"new\"}', NULL, 20),
+               (3, 'anthropic', 'oauth', '{\"access\":\"disabled\"}', 'revoked', 30),
+               (4, 'anthropic', 'api_key', '{\"access\":\"key\"}', NULL, 40),
+               (5, 'openai-codex', 'oauth', '{\"access\":\"codex\"}', NULL, 50);",
+        )
+        .unwrap();
+        // Connection stays open: uncheckpointed WAL rows must still be visible.
+        assert_eq!(read_omp_token(&db).unwrap().as_str(), "new");
+        let p = Claude::detect_omp(&Config::default(), &db).unwrap();
+        assert_eq!(p.id(), "claude:omp");
+        let mut hidden = Config::default();
+        hidden.claude.hide = vec!["omp".into()];
+        assert!(Claude::detect_omp(&hidden, &db).is_none());
+        drop(conn);
+        assert!(read_omp_token(&dir.path().join("missing.db")).is_none());
     }
 
     #[test]
