@@ -165,4 +165,55 @@ mod tests {
         let _ = lookup("copilot-cli");
         assert!(start.elapsed() < LOOKUP_LIMIT + std::time::Duration::from_secs(1));
     }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_item_list_pairs_service_with_account_of_the_same_item() {
+        // Shapes seen in real `security dump-keychain` output; no secret values.
+        let dump = r#"keychain: "/Users/u/Library/Keychains/login.keychain-db"
+version: 512
+class: "genp"
+attributes:
+    0x00000007 <blob>="Claude Code-credentials"
+    "acct"<blob>="u"
+    "cdat"<timedate>=0x32303236  "2026"
+    "svce"<blob>="Claude Code-credentials"
+keychain: "/Users/u/Library/Keychains/login.keychain-db"
+version: 512
+class: "inet"
+attributes:
+    "acct"<blob>="someone"
+    "srvr"<blob>="example.com"
+keychain: "/Users/u/Library/Keychains/login.keychain-db"
+version: 512
+class: "genp"
+attributes:
+    "acct"<blob>=<NULL>
+    "svce"<blob>="gh:github.com"
+keychain: "/Users/u/Library/Keychains/login.keychain-db"
+version: 512
+class: "genp"
+attributes:
+    "acct"<blob>="orphan"
+    "svce"<blob>=<NULL>
+keychain: "/Users/u/Library/Keychains/login.keychain-db"
+version: 512
+class: "genp"
+attributes:
+    "acct"<blob>="cli|67c0c8bd8543f756"
+    "svce"<blob>="Codex Auth""#;
+        let mut items: Vec<(String, String)> = parse_item_list(dump).into_iter().collect();
+        items.sort();
+        let pair = |s: &str, a: &str| (s.to_string(), a.to_string());
+        assert_eq!(
+            items,
+            vec![
+                pair("Claude Code-credentials", "u"),
+                // The last item has no following `keychain:` line and must still count.
+                pair("Codex Auth", "cli|67c0c8bd8543f756"),
+                // A <NULL> account must not inherit the previous item's account.
+                pair("gh:github.com", ""),
+            ]
+        );
+    }
 }

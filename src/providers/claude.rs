@@ -1275,6 +1275,44 @@ mod tests {
     }
 
     #[test]
+    fn logins_whose_account_cannot_be_told_keep_their_own_cards() {
+        // Profile endpoint down (e.g. offline at startup): nothing may be merged by guess.
+        let home = home_with_creds();
+        let omo = home.path().join("omo.json");
+        fs::write(
+            &omo,
+            r#"{"anthropic-subscription":{"accounts":[{"access":"omo-tok","expires":99999999999999}]}}"#,
+        )
+        .unwrap();
+        let omp = home.path().join("agent.db");
+        rusqlite::Connection::open(&omp)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE auth_credentials (id INTEGER PRIMARY KEY, provider TEXT,
+                   credential_type TEXT, data TEXT, disabled_cause TEXT, updated_at INTEGER);
+                 INSERT INTO auth_credentials VALUES
+                   (1, 'anthropic', 'oauth', '{\"access\":\"omp-tok\",\"accountId\":\"me\"}', NULL, 1);",
+            )
+            .unwrap();
+        let server = MockServer::start();
+        let profile = server.mock(|when, then| {
+            when.method(GET).path("/api/oauth/profile");
+            then.status(503);
+        });
+        let cfg = Config::default();
+        let claude_code = Claude::detect(&cfg, &Account::new("", home.path().join(".claude")))
+            .unwrap()
+            .with_api_base(server.base_url());
+        let logins = agent_logins(&cfg, &omo, &omp);
+        let cards = merge_agent_logins(&cfg, vec![claude_code], logins, &server.base_url());
+        let ids: Vec<&str> = cards.iter().map(|c| c.id()).collect();
+        // omp's saved account id is known, but Claude Code's account is not: no match.
+        assert_eq!(ids, vec!["claude", "claude:omo", "claude:omp"]);
+        assert!(cards.iter().all(|c| c.sources.len() == 1));
+        profile.assert_calls(3);
+    }
+
+    #[test]
     fn named_account_has_own_identity() {
         let home = home_with_creds();
         let dir = home.path().join(".claude");
