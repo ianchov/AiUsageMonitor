@@ -1,6 +1,7 @@
 # AI Usage Monitor configuration. Every key is optional.
 # Linux:   ~/.config/ai-usage-monitor/config.toml
 # Windows: %APPDATA%\ai-usage-monitor\config.toml
+# macOS:   ~/Library/Application Support/ai-usage-monitor/config.toml
 
 always_on_top = false
 order = ["claude", "openai", "copilot", "cursor", "minimax", "openrouter"]
@@ -9,7 +10,7 @@ order = ["claude", "openai", "copilot", "cursor", "minimax", "openrouter"]
 enabled = true
 # context_limit = 200000
 poll_seconds = 120               # minimum 60; shared token with Claude Code
-# hide = ["personal"]            # account names; "default" = ~/.claude, "omp" = omp login
+# hide = ["personal"]            # account names; "default" = ~/.claude
 # Extra accounts outside home or nested deeper:
 # [[claude.accounts]]
 # name = "work"
@@ -39,3 +40,7 @@ models = ["general"]
 [openrouter]
 enabled = true
 api_key_env = "OPENROUTER_API_KEY"
+
+[omp]                            # "Claude · omp" card (also off when [claude] is off)
+enabled = true
+db = "~/.omp/agent/agent.db"

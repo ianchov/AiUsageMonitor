@@ -205,7 +205,7 @@ struct SessionCache {
 enum Creds {
     /// Claude Code config folder (`.credentials.json` or the macOS keychain).
     ClaudeDir(PathBuf),
-    /// omp's credential database (`~/.omp/agent/agent.db`).
+    /// omp's credential database (`[omp] db`, default `~/.omp/agent/agent.db`).
     Omp(PathBuf),
 }
 
@@ -316,9 +316,9 @@ impl Claude {
     }
 
     /// The Claude subscription omp is logged in with, shown as "Claude · omp".
-    /// Hidden with `hide = ["omp"]` in `[claude]`.
+    /// Turned off with `[omp] enabled = false` (or `[claude] enabled = false`).
     pub fn detect_omp(cfg: &Config, db: &Path) -> Option<Self> {
-        if !cfg.claude.enabled || cfg.claude.hide.iter().any(|h| h == "omp") {
+        if !cfg.claude.enabled || !cfg.omp.enabled {
             return None;
         }
         let creds = Creds::Omp(db.to_path_buf());
@@ -851,9 +851,9 @@ mod tests {
         assert_eq!(read_omp_token(&db).unwrap().as_str(), "new");
         let p = Claude::detect_omp(&Config::default(), &db).unwrap();
         assert_eq!(p.id(), "claude:omp");
-        let mut hidden = Config::default();
-        hidden.claude.hide = vec!["omp".into()];
-        assert!(Claude::detect_omp(&hidden, &db).is_none());
+        let mut off = Config::default();
+        off.omp.enabled = false;
+        assert!(Claude::detect_omp(&off, &db).is_none());
         drop(conn);
         assert!(read_omp_token(&dir.path().join("missing.db")).is_none());
     }

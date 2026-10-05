@@ -19,6 +19,7 @@ pub struct Config {
     pub cursor: CursorConfig,
     pub minimax: MiniMaxConfig,
     pub openrouter: OpenRouterConfig,
+    pub omp: OmpConfig,
 }
 
 impl Default for Config {
@@ -39,6 +40,7 @@ impl Default for Config {
             cursor: CursorConfig::default(),
             minimax: MiniMaxConfig::default(),
             openrouter: OpenRouterConfig::default(),
+            omp: OmpConfig::default(),
         }
     }
 }
@@ -126,6 +128,24 @@ impl Default for OpenRouterConfig {
         Self {
             enabled: true,
             api_key_env: "OPENROUTER_API_KEY".into(),
+        }
+    }
+}
+
+/// The "Claude · omp" card: the Claude subscription the omp coding agent is logged in with.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct OmpConfig {
+    pub enabled: bool,
+    /// omp's database; `~` is the home folder.
+    pub db: String,
+}
+
+impl Default for OmpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            db: "~/.omp/agent/agent.db".into(),
         }
     }
 }
