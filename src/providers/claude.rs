@@ -219,27 +219,74 @@ impl Creds {
     }
 }
 
-/// Access token of the newest enabled Anthropic OAuth login in omp's database. The
-/// database is opened read-only; omp refreshes the token, this app never does.
-pub fn read_omp_token(db: &Path) -> Option<Zeroizing<String>> {
+/// Newest enabled Anthropic OAuth login in omp's `auth_credentials` table.
+const OMP_LOGIN: &str = "SELECT data FROM auth_credentials \
+     WHERE provider = 'anthropic' AND credential_type = 'oauth' \
+     AND disabled_cause IS NULL ORDER BY updated_at DESC, id DESC LIMIT 1";
+
+/// Opens omp's database read-only. No `immutable`: omp writes it in WAL mode while it runs.
+fn open_omp(db: &Path) -> Option<rusqlite::Connection> {
     use rusqlite::{Connection, OpenFlags};
     if !db.is_file() {
         return None;
     }
-    // No `immutable`: omp writes this database in WAL mode while it runs.
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    let conn = Connection::open_with_flags(db, flags).ok()?;
-    let token: String = conn
+    Connection::open_with_flags(db, flags).ok()
+}
+
+/// Access token of the newest enabled Anthropic OAuth login in omp's database.
+/// omp refreshes the token; this app never does.
+pub fn read_omp_token(db: &Path) -> Option<Zeroizing<String>> {
+    let token: String = open_omp(db)?
         .query_row(
-            "SELECT json_extract(data, '$.access') FROM auth_credentials \
-             WHERE provider = 'anthropic' AND credential_type = 'oauth' \
-             AND disabled_cause IS NULL ORDER BY updated_at DESC, id DESC LIMIT 1",
+            &format!("SELECT json_extract(data, '$.access') FROM ({OMP_LOGIN})"),
             [],
             |row| row.get(0),
         )
         .ok()?;
     let token = Zeroizing::new(token);
     (!token.trim().is_empty()).then(|| Zeroizing::new(token.trim().to_string()))
+}
+
+/// The usage omp last fetched for that login (`usage_history`), and when. Labels follow
+/// omp's limit ids without the `anthropic:` prefix: "5h", "7d", "7d fable".
+pub fn read_omp_usage(db: &Path) -> Option<(Vec<Window>, SystemTime)> {
+    let from_ms = |ms: i64| SystemTime::UNIX_EPOCH + Duration::from_millis(ms.max(0) as u64);
+    let conn = open_omp(db)?;
+    let sql = format!(
+        "WITH login AS (SELECT 'account:' || json_extract(data, '$.accountId') AS key \
+                        FROM ({OMP_LOGIN})), \
+              rows AS (SELECT u.* FROM usage_history u, login \
+                       WHERE u.provider = 'anthropic' AND instr(u.account_key, login.key) > 0) \
+         SELECT limit_id, used_fraction, resets_at, recorded_at FROM rows \
+         WHERE recorded_at = (SELECT max(recorded_at) FROM rows) \
+           AND used_fraction IS NOT NULL ORDER BY limit_id"
+    );
+    let mut stmt = conn.prepare(&sql).ok()?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, f64>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })
+        .ok()?
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    let at = from_ms(rows.first()?.3);
+    let windows = rows
+        .into_iter()
+        .map(|(id, fraction, resets, _)| {
+            let label = id
+                .strip_prefix("anthropic:")
+                .unwrap_or(&id)
+                .replace(':', " ");
+            Window::new(label, fraction * 100.0, resets.map(from_ms))
+        })
+        .collect();
+    Some((windows, at))
 }
 
 pub struct Claude {
@@ -336,18 +383,27 @@ impl Claude {
         Ok(windows)
     }
 
-    /// What to show while the usage call fails transiently: stored windows if any, else
-    /// just the local session.
+    /// What to show while the usage call fails transiently: the newest stored windows
+    /// (this app's own, or for the omp card also the usage omp last fetched), else just
+    /// the local session.
     fn fallback(
         &self,
         err: ProviderError,
         has_session: bool,
         now: SystemTime,
     ) -> Result<ProviderSnapshot, ProviderError> {
-        match &self.last_usage {
+        let omp = match &self.creds {
+            Creds::Omp(db) => read_omp_usage(db),
+            Creds::ClaudeDir(_) => None,
+        };
+        let stored = match (self.last_usage.clone(), omp) {
+            (Some(own), Some(omp)) => Some(if omp.1 > own.1 { omp } else { own }),
+            (own, omp) => own.or(omp),
+        };
+        match stored {
             Some((windows, at)) => {
-                let at: chrono::DateTime<chrono::Local> = (*at).into();
-                let mut snap = ProviderSnapshot::new(usage_cache::expire(windows, now));
+                let at: chrono::DateTime<chrono::Local> = at.into();
+                let mut snap = ProviderSnapshot::new(usage_cache::expire(&windows, now));
                 snap.note = Some(format!("usage as of {} · {err}", at.format("%H:%M")));
                 Ok(snap)
             }
@@ -731,6 +787,47 @@ mod tests {
         let snap = p.poll().unwrap();
         assert!(snap.note.unwrap().contains("rate limited"));
         limited.assert_calls(1);
+    }
+
+    #[test]
+    fn omp_card_shows_omp_usage_when_rate_limited() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("agent.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             CREATE TABLE auth_credentials (id INTEGER PRIMARY KEY, provider TEXT,
+               credential_type TEXT, data TEXT, disabled_cause TEXT, updated_at INTEGER);
+             INSERT INTO auth_credentials VALUES
+               (1, 'anthropic', 'oauth', '{\"access\":\"t\",\"accountId\":\"me\"}', NULL, 1);
+             CREATE TABLE usage_history (recorded_at INTEGER, provider TEXT,
+               account_key TEXT, limit_id TEXT, used_fraction REAL, resets_at INTEGER);
+             INSERT INTO usage_history VALUES
+               (1000, 'anthropic', 'oauth|account:me|email:x', 'anthropic:5h', 0.90, NULL),
+               (2000, 'anthropic', 'oauth|account:me|email:x', 'anthropic:5h', 0.03, 4102444800000),
+               (2000, 'anthropic', 'oauth|account:me|email:x', 'anthropic:7d:fable', 0.58, NULL),
+               (3000, 'anthropic', 'oauth|account:other|email:y', 'anthropic:5h', 0.99, NULL);",
+        )
+        .unwrap();
+        let server = MockServer::start();
+        let limited = server.mock(|when, then| {
+            when.method(GET).path("/api/oauth/usage");
+            then.status(429);
+        });
+        let mut p = Claude::detect_omp(&Config::default(), &db)
+            .unwrap()
+            .with_api_base(server.base_url());
+        let snap = p.poll().unwrap();
+        limited.assert_calls(1);
+        let shown: Vec<(&str, f64)> = snap
+            .windows
+            .iter()
+            .map(|w| (w.label.as_str(), w.used_pct.round()))
+            .collect();
+        assert_eq!(shown, vec![("5h", 3.0), ("7d fable", 58.0)]);
+        assert!(snap.windows[0].resets_at.is_some());
+        assert!(snap.note.unwrap().contains("rate limited"));
+        drop(conn);
     }
 
     #[test]
