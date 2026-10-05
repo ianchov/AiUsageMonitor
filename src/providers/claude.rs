@@ -36,14 +36,11 @@ fn keychain_credentials(_dir: &Path) -> Option<Zeroizing<String>> {
 /// (the value of `CLAUDE_CONFIG_DIR`).
 #[cfg(target_os = "macos")]
 fn keychain_service(dir: &Path, home: &Path) -> String {
-    use sha2::{Digest, Sha256};
     const SERVICE: &str = "Claude Code-credentials";
     if dir == home.join(".claude") {
         return SERVICE.to_string();
     }
-    let hash = Sha256::digest(dir.to_string_lossy().as_bytes());
-    let hex: String = hash[..4].iter().map(|b| format!("{b:02x}")).collect();
-    format!("{SERVICE}-{hex}")
+    format!("{SERVICE}-{}", crate::keychain::path_hash(dir, 4))
 }
 
 pub const API_BASE: &str = "https://api.anthropic.com";
