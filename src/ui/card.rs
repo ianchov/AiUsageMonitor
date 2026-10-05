@@ -117,6 +117,12 @@ fn header(ui: &mut egui::Ui, state: &ProviderState) {
         if let Some(plan) = snap.and_then(|s| s.plan.as_deref()) {
             ui.label(RichText::new(plan).color(theme::MUTED));
         }
+        if let Some(source) = snap.and_then(|s| s.source.as_deref()) {
+            ui.label(RichText::new(source).small().color(theme::MUTED))
+                .on_hover_text(
+                    "Login that answered (CC = Claude Code) · how the numbers were obtained",
+                );
+        }
         if let Some(session) = snap.and_then(|s| s.session.as_ref()) {
             let model = match &session.effort {
                 Some(effort) => format!("{} ({effort})", session.model),

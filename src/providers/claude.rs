@@ -214,6 +214,15 @@ enum Creds {
 }
 
 impl Creds {
+    /// Short name shown on the card: "CC" (Claude Code), "omo", "omp".
+    fn label(&self) -> &'static str {
+        match self {
+            Self::ClaudeDir(_) => "CC",
+            Self::Omo(_) => "omo",
+            Self::Omp(_) => "omp",
+        }
+    }
+
     /// (access token, subscription type).
     fn token(&self) -> Option<(Zeroizing<String>, Option<String>)> {
         match self {
@@ -382,6 +391,8 @@ pub struct Claude {
     last_usage: Option<(Vec<Window>, SystemTime)>,
     usage_file: Option<PathBuf>,
     plan: Option<String>,
+    /// Login whose token produced `last_usage`; `None` for a reading loaded at startup.
+    last_from: Option<&'static str>,
 }
 
 /// A Claude subscription login of another coding agent (omo, omp).
@@ -485,6 +496,7 @@ impl Claude {
             last_usage: None,
             usage_file: None,
             plan: None,
+            last_from: None,
         }
     }
 
@@ -501,6 +513,15 @@ impl Claude {
         self
     }
 
+    /// Source text for the app's own stored reading: "omo · cached", or just "cached"
+    /// when it was loaded from the cache file at startup.
+    fn cached_source(&self) -> String {
+        match self.last_from {
+            Some(label) => format!("{label} · cached"),
+            None => "cached".to_string(),
+        }
+    }
+
     /// Stored usage young enough to show without calling the endpoint (e.g. after a restart).
     fn recent_usage(&self, now: SystemTime) -> Option<(Vec<Window>, SystemTime)> {
         let (windows, at) = self.last_usage.as_ref()?;
@@ -511,9 +532,10 @@ impl Claude {
     /// Asks the sources in order; the first answer wins. When all fail, the most useful
     /// error is returned: a transient one (stored data stays on screen), else a rejected
     /// token, else missing credentials.
-    fn usage(&mut self, now: SystemTime) -> Result<Vec<Window>, ProviderError> {
+    /// Returns the windows and where they came from ("omo · live", "CC · cached").
+    fn usage(&mut self, now: SystemTime) -> Result<(Vec<Window>, String), ProviderError> {
         if let Some((windows, _)) = self.recent_usage(now) {
-            return Ok(windows);
+            return Ok((windows, self.cached_source()));
         }
         let rank = |e: &ProviderError| match e {
             e if e.is_transient() => 2,
@@ -535,7 +557,9 @@ impl Claude {
                         usage_cache::save(file, &windows, now);
                     }
                     self.last_usage = Some((windows.clone(), now));
-                    return Ok(windows);
+                    let label = source.creds.label();
+                    self.last_from = Some(label);
+                    return Ok((windows, format!("{label} · live")));
                 }
                 Err(e) if rank(&e) >= rank(&error) => error = e,
                 Err(_) => {}
@@ -558,14 +582,17 @@ impl Claude {
             Creds::ClaudeDir(_) | Creds::Omo(_) => None,
         });
         let stored = match (self.last_usage.clone(), omp) {
-            (Some(own), Some(omp)) => Some(if omp.1 > own.1 { omp } else { own }),
-            (own, omp) => own.or(omp),
+            (Some(own), Some(omp)) if omp.1 > own.1 => Some((omp, "omp saved".to_string())),
+            (Some(own), _) => Some((own, self.cached_source())),
+            (None, Some(omp)) => Some((omp, "omp saved".to_string())),
+            (None, None) => None,
         };
         match stored {
-            Some((windows, at)) => {
+            Some(((windows, at), source)) => {
                 let at: chrono::DateTime<chrono::Local> = at.into();
                 let mut snap = ProviderSnapshot::new(usage_cache::expire(&windows, now));
                 snap.note = Some(format!("usage as of {} · {err}", at.format("%H:%M")));
+                snap.source = Some(source);
                 Ok(snap)
             }
             None if has_session => {
@@ -662,7 +689,11 @@ impl Provider for Claude {
         // The session is local and always readable: keep it live while the API is down.
         let session = self.current_session();
         let mut snapshot = match usage {
-            Ok(windows) => ProviderSnapshot::new(windows),
+            Ok((windows, source)) => {
+                let mut snap = ProviderSnapshot::new(windows);
+                snap.source = Some(source);
+                snap
+            }
             Err(e) if e.is_transient() => self.fallback(e, session.is_some(), now)?,
             Err(e) => return Err(e),
         };
@@ -975,6 +1006,7 @@ mod tests {
         });
         let snap = p.poll().unwrap();
         assert_eq!(snap.windows.len(), 2, "cached windows kept");
+        assert_eq!(snap.source.as_deref(), Some("CC · cached"));
         assert!(snap.note.unwrap().contains("rate limited"));
         let snap = p.poll().unwrap();
         assert!(snap.note.unwrap().contains("rate limited"));
@@ -1024,6 +1056,7 @@ mod tests {
             .map(|w| (w.label.as_str(), w.used_pct.round()))
             .collect();
         assert_eq!(shown, vec![("5h", 3.0), ("7d fable", 58.0)]);
+        assert_eq!(snap.source.as_deref(), Some("omp saved"));
         assert!(snap.windows[0].resets_at.is_some());
         assert!(snap.note.unwrap().contains("rate limited"));
         drop(conn);
@@ -1141,6 +1174,7 @@ mod tests {
 
         let snap = cards[0].poll().unwrap();
         assert_eq!(snap.windows.len(), 2, "omo's token answered");
+        assert_eq!(snap.source.as_deref(), Some("omo · live"));
         assert_eq!(snap.note, None);
         assert_eq!(
             snap.plan.as_deref(),

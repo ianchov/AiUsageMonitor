@@ -102,6 +102,8 @@ pub struct ProviderSnapshot {
     pub windows: Vec<Window>,
     pub session: Option<Session>,
     pub note: Option<String>,
+    /// Where the numbers came from, e.g. "omo · live" or "omp saved".
+    pub source: Option<String>,
     pub updated_at: SystemTime,
 }
 
@@ -112,6 +114,7 @@ impl ProviderSnapshot {
             windows,
             session: None,
             note: None,
+            source: None,
             updated_at: SystemTime::now(),
         }
     }
