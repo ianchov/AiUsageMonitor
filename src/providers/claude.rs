@@ -48,6 +48,8 @@ pub const API_BASE: &str = "https://api.anthropic.com";
 const DEFAULT_CONTEXT: u64 = 200_000;
 const LONG_CONTEXT: u64 = 1_000_000;
 const SYNTHETIC_MODEL: &str = "<synthetic>";
+/// Upper bound for one account lookup at startup.
+const PROFILE_LIMIT: Duration = Duration::from_secs(5);
 
 #[derive(Deserialize)]
 struct CredFile<'a> {
@@ -207,6 +209,8 @@ enum Creds {
     ClaudeDir(PathBuf),
     /// omp's credential database (`[omp] db`, default `~/.omp/agent/agent.db`).
     Omp(PathBuf),
+    /// omo's credential file (`[omo] auth`, default `~/.omo/agent/auth.json`).
+    Omo(PathBuf),
 }
 
 impl Creds {
@@ -215,8 +219,62 @@ impl Creds {
         match self {
             Self::ClaudeDir(dir) => parse_credentials(&read_credentials(dir)?),
             Self::Omp(db) => read_omp_token(db).map(|token| (token, None)),
+            Self::Omo(file) => {
+                parse_omo_auth(&read_secret_file(file)?, SystemTime::now()).map(|t| (t, None))
+            }
         }
     }
+
+    /// Claude account uuid of this login: omp's saved id, else asked from the profile
+    /// endpoint. `None` when it cannot be told (e.g. offline).
+    fn account_id(&self, api_base: &str) -> Option<String> {
+        if let Self::Omp(db) = self {
+            if let Some(id) = read_omp_account(db) {
+                return Some(id);
+            }
+        }
+        fetch_account(api_base, self.token()?.0)
+    }
+}
+
+#[derive(Deserialize)]
+struct OmoAuth<'a> {
+    #[serde(rename = "anthropic-subscription", borrow)]
+    subscription: Option<OmoSubscription<'a>>,
+}
+
+#[derive(Deserialize)]
+struct OmoSubscription<'a> {
+    #[serde(borrow, default)]
+    accounts: Vec<OmoAccount<'a>>,
+}
+
+#[derive(Deserialize)]
+struct OmoAccount<'a> {
+    #[serde(borrow)]
+    access: Option<&'a str>,
+    /// Unix milliseconds.
+    expires: Option<u64>,
+}
+
+/// OAuth access token of omo's Claude subscription login: the first account in
+/// `anthropic-subscription.accounts` whose token has not expired, else the first with a
+/// token (the endpoint then rejects it and the card turns red). The top-level `access`
+/// of that entry is not an OAuth token and is ignored. omo refreshes; this app never does.
+pub fn parse_omo_auth(text: &str, now: SystemTime) -> Option<Zeroizing<String>> {
+    let auth: OmoAuth = serde_json::from_str(text).ok()?;
+    let now_ms = now.duration_since(SystemTime::UNIX_EPOCH).ok()?.as_millis();
+    let accounts: Vec<_> = auth
+        .subscription?
+        .accounts
+        .into_iter()
+        .filter(|a| a.access.is_some_and(|t| !t.trim().is_empty()))
+        .collect();
+    let live = accounts
+        .iter()
+        .find(|a| a.expires.is_some_and(|e| u128::from(e) > now_ms));
+    let token = live.or(accounts.first())?.access?;
+    Some(Zeroizing::new(token.trim().to_string()))
 }
 
 /// Newest enabled Anthropic OAuth login in omp's `auth_credentials` table.
@@ -246,6 +304,19 @@ pub fn read_omp_token(db: &Path) -> Option<Zeroizing<String>> {
         .ok()?;
     let token = Zeroizing::new(token);
     (!token.trim().is_empty()).then(|| Zeroizing::new(token.trim().to_string()))
+}
+
+/// Account uuid omp saved with its newest Anthropic login.
+fn read_omp_account(db: &Path) -> Option<String> {
+    open_omp(db)?
+        .query_row(
+            &format!("SELECT json_extract(data, '$.accountId') FROM ({OMP_LOGIN})"),
+            [],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
+        .filter(|id| !id.is_empty())
 }
 
 /// The usage omp last fetched for that login (`usage_history`), and when. Labels follow
@@ -289,10 +360,19 @@ pub fn read_omp_usage(db: &Path) -> Option<(Vec<Window>, SystemTime)> {
     Some((windows, at))
 }
 
+/// One token source of a card, with its own backoff: a 429 on one token does not hold
+/// off the others.
+struct Source {
+    creds: Creds,
+    backoff: Backoff,
+}
+
+/// One card per Claude account. `sources` are tried in order (Claude Code, omo, omp);
+/// the first that answers wins.
 pub struct Claude {
     id: String,
     name: String,
-    creds: Creds,
+    sources: Vec<Source>,
     /// Claude Code folder whose `projects/` logs feed the session block.
     sessions: Option<PathBuf>,
     api_base: String,
@@ -301,7 +381,77 @@ pub struct Claude {
     cache: Option<SessionCache>,
     last_usage: Option<(Vec<Window>, SystemTime)>,
     usage_file: Option<PathBuf>,
-    backoff: Backoff,
+    plan: Option<String>,
+}
+
+/// A Claude subscription login of another coding agent (omo, omp).
+pub struct AgentLogin {
+    name: &'static str,
+    creds: Creds,
+}
+
+/// omo's and omp's Claude logins, in that order, when enabled and holding a token.
+pub fn agent_logins(cfg: &Config, omo_auth: &Path, omp_db: &Path) -> Vec<AgentLogin> {
+    if !cfg.claude.enabled {
+        return Vec::new();
+    }
+    [
+        (cfg.omo.enabled, "omo", Creds::Omo(omo_auth.to_path_buf())),
+        (cfg.omp.enabled, "omp", Creds::Omp(omp_db.to_path_buf())),
+    ]
+    .into_iter()
+    .filter(|(enabled, _, creds)| *enabled && creds.token().is_some())
+    .map(|(_, name, creds)| AgentLogin { name, creds })
+    .collect()
+}
+
+/// Adds each agent login as an extra token source to the card of the same Claude
+/// account (asked from the profile endpoint, or omp's saved account id). A login whose
+/// account matches no card, or cannot be told, gets its own card: "Claude" when there is
+/// no Claude Code card, else "Claude · omo" / "Claude · omp".
+pub fn merge_agent_logins(
+    cfg: &Config,
+    mut cards: Vec<Claude>,
+    logins: Vec<AgentLogin>,
+    api_base: &str,
+) -> Vec<Claude> {
+    if logins.is_empty() {
+        return cards;
+    }
+    let mut accounts: Vec<Option<String>> = cards
+        .iter()
+        .map(|c| c.sources[0].creds.account_id(api_base))
+        .collect();
+    for login in logins {
+        let account = login.creds.account_id(api_base);
+        let same = account
+            .as_ref()
+            .and_then(|a| accounts.iter().position(|c| c.as_ref() == Some(a)));
+        if let Some(i) = same {
+            let card = &mut cards[i];
+            card.sources.push(Source::new(login.creds, card.interval));
+            continue;
+        }
+        let (id, name) = if cards.iter().any(|c| c.id == "claude") {
+            Account::new(login.name, "").identity("claude", "Claude")
+        } else {
+            ("claude".to_string(), "Claude".to_string())
+        };
+        let mut card = Claude::new(cfg, id, name, login.creds, None);
+        card.api_base = api_base.to_string();
+        cards.push(card);
+        accounts.push(account);
+    }
+    cards
+}
+
+impl Source {
+    fn new(creds: Creds, interval: Duration) -> Self {
+        Self {
+            creds,
+            backoff: Backoff::new(interval),
+        }
+    }
 }
 
 impl Claude {
@@ -315,18 +465,6 @@ impl Claude {
         Some(Self::new(cfg, id, name, creds, Some(account.dir.clone())))
     }
 
-    /// The Claude subscription omp is logged in with, shown as "Claude · omp".
-    /// Turned off with `[omp] enabled = false` (or `[claude] enabled = false`).
-    pub fn detect_omp(cfg: &Config, db: &Path) -> Option<Self> {
-        if !cfg.claude.enabled || !cfg.omp.enabled {
-            return None;
-        }
-        let creds = Creds::Omp(db.to_path_buf());
-        creds.token()?;
-        let (id, name) = Account::new("omp", db).identity("claude", "Claude");
-        Some(Self::new(cfg, id, name, creds, None))
-    }
-
     fn new(
         cfg: &Config,
         id: String,
@@ -338,7 +476,7 @@ impl Claude {
         Self {
             id,
             name,
-            creds,
+            sources: vec![Source::new(creds, interval)],
             sessions,
             api_base: API_BASE.to_string(),
             limit_override: cfg.claude.context_limit,
@@ -346,7 +484,7 @@ impl Claude {
             cache: None,
             last_usage: None,
             usage_file: None,
-            backoff: Backoff::new(interval),
+            plan: None,
         }
     }
 
@@ -370,17 +508,40 @@ impl Claude {
         (age < self.interval / 2).then(|| (windows.clone(), *at))
     }
 
-    fn usage(&mut self, token: &str, now: SystemTime) -> Result<Vec<Window>, ProviderError> {
+    /// Asks the sources in order; the first answer wins. When all fail, the most useful
+    /// error is returned: a transient one (stored data stays on screen), else a rejected
+    /// token, else missing credentials.
+    fn usage(&mut self, now: SystemTime) -> Result<Vec<Window>, ProviderError> {
         if let Some((windows, _)) = self.recent_usage(now) {
             return Ok(windows);
         }
+        let rank = |e: &ProviderError| match e {
+            e if e.is_transient() => 2,
+            ProviderError::Auth => 1,
+            _ => 0,
+        };
+        let mut error = ProviderError::NoCredentials;
         let api_base = &self.api_base;
-        let windows = self.backoff.call(|| fetch_usage(api_base, token))?;
-        if let Some(file) = &self.usage_file {
-            usage_cache::save(file, &windows, now);
+        for source in &mut self.sources {
+            let Some((token, plan)) = source.creds.token() else {
+                continue;
+            };
+            if plan.is_some() {
+                self.plan = plan;
+            }
+            match source.backoff.call(|| fetch_usage(api_base, &token)) {
+                Ok(windows) => {
+                    if let Some(file) = &self.usage_file {
+                        usage_cache::save(file, &windows, now);
+                    }
+                    self.last_usage = Some((windows.clone(), now));
+                    return Ok(windows);
+                }
+                Err(e) if rank(&e) >= rank(&error) => error = e,
+                Err(_) => {}
+            }
         }
-        self.last_usage = Some((windows.clone(), now));
-        Ok(windows)
+        Err(error)
     }
 
     /// What to show while the usage call fails transiently: the newest stored windows
@@ -392,10 +553,10 @@ impl Claude {
         has_session: bool,
         now: SystemTime,
     ) -> Result<ProviderSnapshot, ProviderError> {
-        let omp = match &self.creds {
+        let omp = self.sources.iter().find_map(|s| match &s.creds {
             Creds::Omp(db) => read_omp_usage(db),
-            Creds::ClaudeDir(_) => None,
-        };
+            Creds::ClaudeDir(_) | Creds::Omo(_) => None,
+        });
         let stored = match (self.last_usage.clone(), omp) {
             (Some(own), Some(omp)) => Some(if omp.1 > own.1 { omp } else { own }),
             (own, omp) => own.or(omp),
@@ -436,6 +597,35 @@ impl Claude {
     }
 }
 
+/// Account uuid of an OAuth token (`/api/oauth/profile`), bounded so startup cannot hang.
+fn fetch_account(api_base: &str, token: Zeroizing<String>) -> Option<String> {
+    #[derive(Deserialize)]
+    struct Profile {
+        account: ProfileAccount,
+    }
+    #[derive(Deserialize)]
+    struct ProfileAccount {
+        uuid: String,
+    }
+    let url = format!("{api_base}/api/oauth/profile");
+    let call = move || {
+        let bearer = Zeroizing::new(format!("Bearer {}", token.as_str()));
+        let resp = http::get(
+            &url,
+            &[
+                ("Authorization", bearer.as_str()),
+                ("anthropic-beta", "oauth-2025-04-20"),
+                ("Accept", "application/json"),
+            ],
+        )
+        .ok()?;
+        resp.check().ok()?;
+        let profile: Profile = serde_json::from_str(&resp.body).ok()?;
+        Some(profile.account.uuid)
+    };
+    crate::accounts::with_deadline(PROFILE_LIMIT, call).flatten()
+}
+
 fn fetch_usage(api_base: &str, token: &str) -> Result<Vec<Window>, ProviderError> {
     let bearer = Zeroizing::new(format!("Bearer {token}"));
     let resp = http::get(
@@ -464,9 +654,11 @@ impl Provider for Claude {
     }
 
     fn poll(&mut self) -> Result<ProviderSnapshot, ProviderError> {
-        let (token, plan) = self.creds.token().ok_or(ProviderError::NoCredentials)?;
+        if self.plan.is_none() {
+            self.plan = self.sources.iter().find_map(|s| s.creds.token()?.1);
+        }
         let now = SystemTime::now();
-        let usage = self.usage(&token, now);
+        let usage = self.usage(now);
         // The session is local and always readable: keep it live while the API is down.
         let session = self.current_session();
         let mut snapshot = match usage {
@@ -474,7 +666,7 @@ impl Provider for Claude {
             Err(e) if e.is_transient() => self.fallback(e, session.is_some(), now)?,
             Err(e) => return Err(e),
         };
-        snapshot.plan = plan;
+        snapshot.plan = self.plan.clone();
         snapshot.session = session;
         Ok(snapshot)
     }
@@ -675,7 +867,7 @@ mod tests {
         assert!(snap.session.is_some(), "local session still shown");
         assert!(snap.note.unwrap().contains("usage unavailable"));
         fs::remove_dir_all(home.path().join(".claude/projects")).unwrap();
-        p.backoff.reset();
+        p.sources[0].backoff.reset();
         assert_eq!(p.poll(), Err(ProviderError::Network("HTTP 500".into())));
     }
 
@@ -756,7 +948,7 @@ mod tests {
             then.status(401);
         });
         assert!(p.poll().is_ok(), "still backing off: no request");
-        p.backoff.reset();
+        p.sources[0].backoff.reset();
         assert_eq!(p.poll(), Err(ProviderError::Auth));
     }
 
@@ -814,9 +1006,16 @@ mod tests {
             when.method(GET).path("/api/oauth/usage");
             then.status(429);
         });
-        let mut p = Claude::detect_omp(&Config::default(), &db)
-            .unwrap()
-            .with_api_base(server.base_url());
+        let logins = agent_logins(&Config::default(), &dir.path().join("none"), &db);
+        let mut cards =
+            merge_agent_logins(&Config::default(), Vec::new(), logins, &server.base_url());
+        assert_eq!(cards.len(), 1);
+        let p = &mut cards[0];
+        assert_eq!(
+            p.id(),
+            "claude",
+            "no Claude Code card: the omp login is the Claude card"
+        );
         let snap = p.poll().unwrap();
         limited.assert_calls(1);
         let shown: Vec<(&str, f64)> = snap
@@ -828,6 +1027,34 @@ mod tests {
         assert!(snap.windows[0].resets_at.is_some());
         assert!(snap.note.unwrap().contains("rate limited"));
         drop(conn);
+    }
+
+    #[test]
+    fn omo_token_prefers_unexpired_account_and_ignores_top_level_access() {
+        let now = UNIX_EPOCH + Duration::from_millis(2_000);
+        let auth = |accounts: &str| {
+            format!(
+                r#"{{"anthropic-subscription":{{"type":"oauth","access":"claude-sdk",
+                "expires":4102444800000,"accounts":[{accounts}]}}}}"#
+            )
+        };
+        let both =
+            auth(r#"{"access":"expired","expires":1000},{"access":" live ","expires":3000}"#);
+        assert_eq!(parse_omo_auth(&both, now).unwrap().as_str(), "live");
+        // All expired: the first token is still used, so the endpoint can reject it (red card).
+        let stale = auth(r#"{"access":"","expires":3000},{"access":"old","expires":1000}"#);
+        assert_eq!(parse_omo_auth(&stale, now).unwrap().as_str(), "old");
+        assert!(parse_omo_auth(&auth(""), now).is_none());
+        assert!(parse_omo_auth(r#"{"openai":{}}"#, now).is_none());
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("auth.json");
+        fs::write(&file, auth(r#"{"access":"tok","expires":99999999999999}"#)).unwrap();
+        let none = dir.path().join("none");
+        assert_eq!(agent_logins(&Config::default(), &file, &none).len(), 1);
+        let mut off = Config::default();
+        off.omo.enabled = false;
+        assert!(agent_logins(&off, &file, &none).is_empty());
     }
 
     #[test]
@@ -849,13 +1076,79 @@ mod tests {
         .unwrap();
         // Connection stays open: uncheckpointed WAL rows must still be visible.
         assert_eq!(read_omp_token(&db).unwrap().as_str(), "new");
-        let p = Claude::detect_omp(&Config::default(), &db).unwrap();
-        assert_eq!(p.id(), "claude:omp");
+        let none = dir.path().join("none");
+        assert_eq!(agent_logins(&Config::default(), &none, &db).len(), 1);
         let mut off = Config::default();
         off.omp.enabled = false;
-        assert!(Claude::detect_omp(&off, &db).is_none());
+        assert!(agent_logins(&off, &none, &db).is_empty());
         drop(conn);
         assert!(read_omp_token(&dir.path().join("missing.db")).is_none());
+    }
+
+    #[test]
+    fn agent_logins_join_the_card_of_their_account_and_take_over_on_429() {
+        let home = home_with_creds();
+        let omo = home.path().join("omo.json");
+        fs::write(
+            &omo,
+            r#"{"anthropic-subscription":{"accounts":[{"access":"omo-tok","expires":99999999999999}]}}"#,
+        )
+        .unwrap();
+        let omp = home.path().join("agent.db");
+        rusqlite::Connection::open(&omp)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE auth_credentials (id INTEGER PRIMARY KEY, provider TEXT,
+                   credential_type TEXT, data TEXT, disabled_cause TEXT, updated_at INTEGER);
+                 INSERT INTO auth_credentials VALUES
+                   (1, 'anthropic', 'oauth', '{\"access\":\"omp-tok\",\"accountId\":\"other\"}', NULL, 1);",
+            )
+            .unwrap();
+        let server = MockServer::start();
+        for token in ["test-access-token", "omo-tok"] {
+            server.mock(|when, then| {
+                when.method(GET)
+                    .path("/api/oauth/profile")
+                    .header("authorization", format!("Bearer {token}"));
+                then.status(200).body(r#"{"account":{"uuid":"me"}}"#);
+            });
+        }
+        let limited = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/oauth/usage")
+                .header("authorization", "Bearer test-access-token");
+            then.status(429);
+        });
+        let ok = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/oauth/usage")
+                .header("authorization", "Bearer omo-tok");
+            then.status(200).body(USAGE);
+        });
+        let cfg = Config::default();
+        let claude_code = Claude::detect(&cfg, &Account::new("", home.path().join(".claude")))
+            .unwrap()
+            .with_api_base(server.base_url());
+        let logins = agent_logins(&cfg, &omo, &omp);
+        let mut cards = merge_agent_logins(&cfg, vec![claude_code], logins, &server.base_url());
+        let ids: Vec<&str> = cards.iter().map(|c| c.id()).collect();
+        assert_eq!(
+            ids,
+            vec!["claude", "claude:omp"],
+            "omo joined, omp is another account"
+        );
+        assert_eq!(cards[0].sources.len(), 2);
+
+        let snap = cards[0].poll().unwrap();
+        assert_eq!(snap.windows.len(), 2, "omo's token answered");
+        assert_eq!(snap.note, None);
+        assert_eq!(
+            snap.plan.as_deref(),
+            Some("max"),
+            "plan still from Claude Code"
+        );
+        limited.assert_calls(1);
+        ok.assert_calls(1);
     }
 
     #[test]

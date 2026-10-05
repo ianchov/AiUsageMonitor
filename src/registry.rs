@@ -63,20 +63,23 @@ pub fn all_providers(cfg: &Config, paths: &Paths) -> Vec<Box<dyn Provider>> {
     let mut found: Vec<Box<dyn Provider>> = Vec::new();
     if cfg.claude.enabled {
         let claude = &cfg.claude;
-        for account in accounts_for(
+        let cards: Vec<Claude> = accounts_for(
             paths,
             &paths.claude_dir,
             &CLAUDE_RULES,
             &claude.accounts,
             &claude.hide,
-        ) {
-            if let Some(p) = Claude::detect(cfg, &account) {
-                found.push(Box::new(p.with_cache_dir(&paths.cache_dir)));
-            }
-        }
-        let omp_db = accounts::expand_home(&cfg.omp.db, &paths.home);
-        if let Some(p) = Claude::detect_omp(cfg, &omp_db) {
-            found.push(Box::new(p.with_cache_dir(&paths.cache_dir)));
+        )
+        .iter()
+        .filter_map(|account| Claude::detect(cfg, account))
+        .collect();
+        let logins = claude::agent_logins(
+            cfg,
+            &accounts::expand_home(&cfg.omo.auth, &paths.home),
+            &accounts::expand_home(&cfg.omp.db, &paths.home),
+        );
+        for card in claude::merge_agent_logins(cfg, cards, logins, claude::API_BASE) {
+            found.push(Box::new(card.with_cache_dir(&paths.cache_dir)));
         }
     }
     if cfg.openai.enabled {

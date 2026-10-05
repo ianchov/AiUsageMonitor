@@ -20,6 +20,7 @@ pub struct Config {
     pub minimax: MiniMaxConfig,
     pub openrouter: OpenRouterConfig,
     pub omp: OmpConfig,
+    pub omo: OmoConfig,
 }
 
 impl Default for Config {
@@ -41,6 +42,7 @@ impl Default for Config {
             minimax: MiniMaxConfig::default(),
             openrouter: OpenRouterConfig::default(),
             omp: OmpConfig::default(),
+            omo: OmoConfig::default(),
         }
     }
 }
@@ -132,7 +134,7 @@ impl Default for OpenRouterConfig {
     }
 }
 
-/// The "Claude · omp" card: the Claude subscription the omp coding agent is logged in with.
+/// omp's Claude subscription login, an extra token source for the Claude card of its account.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct OmpConfig {
@@ -146,6 +148,24 @@ impl Default for OmpConfig {
         Self {
             enabled: true,
             db: "~/.omp/agent/agent.db".into(),
+        }
+    }
+}
+
+/// omo's Claude subscription login, an extra token source for the Claude card of its account.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct OmoConfig {
+    pub enabled: bool,
+    /// omo's credential file; `~` is the home folder.
+    pub auth: String,
+}
+
+impl Default for OmoConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            auth: "~/.omo/agent/auth.json".into(),
         }
     }
 }
