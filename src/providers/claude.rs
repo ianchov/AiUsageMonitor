@@ -234,15 +234,18 @@ impl Creds {
         }
     }
 
-    /// Claude account uuid of this login: omp's saved id, else asked from the profile
-    /// endpoint. `None` when it cannot be told (e.g. offline).
-    fn account_id(&self, api_base: &str) -> Option<String> {
-        if let Self::Omp(db) = self {
-            if let Some(id) = read_omp_account(db) {
-                return Some(id);
-            }
-        }
-        fetch_account(api_base, self.token()?.0)
+    /// This login's profile, and its account uuid: from the profile endpoint, else omp's
+    /// saved id. `None` when it cannot be told (e.g. offline).
+    fn lookup(&self, api_base: &str) -> (Option<String>, Option<Profile>) {
+        let profile = self.token().and_then(|(t, _)| fetch_profile(api_base, t));
+        let id = profile
+            .as_ref()
+            .map(|p| p.uuid.clone())
+            .or_else(|| match self {
+                Self::Omp(db) => read_omp_account(db),
+                Self::ClaudeDir(_) | Self::Omo(_) => None,
+            });
+        (id, profile)
     }
 }
 
@@ -393,6 +396,9 @@ pub struct Claude {
     plan: Option<String>,
     /// Login whose token produced `last_usage`; `None` for a reading loaded at startup.
     last_from: Option<&'static str>,
+    /// Account of the card, asked once from the profile endpoint.
+    profile: Option<Profile>,
+    profile_tried: bool,
 }
 
 /// A Claude subscription login of another coding agent (omo, omp).
@@ -429,12 +435,15 @@ pub fn merge_agent_logins(
     if logins.is_empty() {
         return cards;
     }
-    let mut accounts: Vec<Option<String>> = cards
-        .iter()
-        .map(|c| c.sources[0].creds.account_id(api_base))
-        .collect();
+    let mut accounts = Vec::new();
+    for card in &mut cards {
+        let (id, profile) = card.sources[0].creds.lookup(api_base);
+        card.profile = profile;
+        card.profile_tried = true;
+        accounts.push(id);
+    }
     for login in logins {
-        let account = login.creds.account_id(api_base);
+        let (account, profile) = login.creds.lookup(api_base);
         let same = account
             .as_ref()
             .and_then(|a| accounts.iter().position(|c| c.as_ref() == Some(a)));
@@ -450,6 +459,8 @@ pub fn merge_agent_logins(
         };
         let mut card = Claude::new(cfg, id, name, login.creds, None);
         card.api_base = api_base.to_string();
+        card.profile = profile;
+        card.profile_tried = true;
         cards.push(card);
         accounts.push(account);
     }
@@ -497,6 +508,8 @@ impl Claude {
             usage_file: None,
             plan: None,
             last_from: None,
+            profile: None,
+            profile_tried: false,
         }
     }
 
@@ -624,15 +637,29 @@ impl Claude {
     }
 }
 
-/// Account uuid of an OAuth token (`/api/oauth/profile`), bounded so startup cannot hang.
-fn fetch_account(api_base: &str, token: Zeroizing<String>) -> Option<String> {
+/// Claude account behind an OAuth token (`/api/oauth/profile`).
+#[derive(Debug, Clone, PartialEq)]
+struct Profile {
+    uuid: String,
+    email: Option<String>,
+    /// "max" or "pro".
+    plan: Option<String>,
+}
+
+/// Asks the profile endpoint, bounded so a hung call cannot block startup or a poll.
+fn fetch_profile(api_base: &str, token: Zeroizing<String>) -> Option<Profile> {
     #[derive(Deserialize)]
-    struct Profile {
-        account: ProfileAccount,
+    struct Body {
+        account: BodyAccount,
     }
     #[derive(Deserialize)]
-    struct ProfileAccount {
+    struct BodyAccount {
         uuid: String,
+        email: Option<String>,
+        #[serde(default)]
+        has_claude_max: bool,
+        #[serde(default)]
+        has_claude_pro: bool,
     }
     let url = format!("{api_base}/api/oauth/profile");
     let call = move || {
@@ -647,10 +674,29 @@ fn fetch_account(api_base: &str, token: Zeroizing<String>) -> Option<String> {
         )
         .ok()?;
         resp.check().ok()?;
-        let profile: Profile = serde_json::from_str(&resp.body).ok()?;
-        Some(profile.account.uuid)
+        let a = serde_json::from_str::<Body>(&resp.body).ok()?.account;
+        let plan = match (a.has_claude_max, a.has_claude_pro) {
+            (true, _) => Some("max".to_string()),
+            (false, true) => Some("pro".to_string()),
+            _ => None,
+        };
+        Some(Profile {
+            uuid: a.uuid,
+            email: a.email,
+            plan,
+        })
     };
     crate::accounts::with_deadline(PROFILE_LIMIT, call).flatten()
+}
+
+/// Shortens an email for display: "office@example.bg" → "of…@example.bg".
+pub fn mask_email(email: &str) -> String {
+    let Some((local, domain)) = email.split_once('@') else {
+        return "…".to_string();
+    };
+    let keep = if local.chars().count() > 2 { 2 } else { 1 };
+    let head: String = local.chars().take(keep).collect();
+    format!("{head}…@{domain}")
 }
 
 fn fetch_usage(api_base: &str, token: &str) -> Result<Vec<Window>, ProviderError> {
@@ -681,8 +727,17 @@ impl Provider for Claude {
     }
 
     fn poll(&mut self) -> Result<ProviderSnapshot, ProviderError> {
+        if !self.profile_tried {
+            self.profile_tried = true;
+            let api_base = &self.api_base;
+            self.profile = self
+                .sources
+                .iter()
+                .find_map(|s| fetch_profile(api_base, s.creds.token()?.0));
+        }
         if self.plan.is_none() {
-            self.plan = self.sources.iter().find_map(|s| s.creds.token()?.1);
+            let own = self.sources.iter().find_map(|s| s.creds.token()?.1);
+            self.plan = own.or_else(|| self.profile.as_ref()?.plan.clone());
         }
         let now = SystemTime::now();
         let usage = self.usage(now);
@@ -698,6 +753,11 @@ impl Provider for Claude {
             Err(e) => return Err(e),
         };
         snapshot.plan = self.plan.clone();
+        if let Some(email) = self.profile.as_ref().and_then(|p| p.email.as_deref()) {
+            snapshot.source = snapshot
+                .source
+                .map(|s| format!("{} · {s}", mask_email(email)));
+        }
         snapshot.session = session;
         Ok(snapshot)
     }
@@ -1014,6 +1074,14 @@ mod tests {
     }
 
     #[test]
+    fn mask_email_keeps_start_and_domain() {
+        assert_eq!(mask_email("office@example.bg"), "of…@example.bg");
+        assert_eq!(mask_email("ab@x.io"), "a…@x.io");
+        assert_eq!(mask_email("Ünïcode@x.io"), "Ün…@x.io");
+        assert_eq!(mask_email("not-an-email"), "…");
+    }
+
+    #[test]
     fn omp_card_shows_omp_usage_when_rate_limited() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("agent.db");
@@ -1038,6 +1106,12 @@ mod tests {
             when.method(GET).path("/api/oauth/usage");
             then.status(429);
         });
+        server.mock(|when, then| {
+            when.method(GET).path("/api/oauth/profile");
+            then.status(200).body(
+                r#"{"account":{"uuid":"me","email":"office@example.com","has_claude_max":true}}"#,
+            );
+        });
         let logins = agent_logins(&Config::default(), &dir.path().join("none"), &db);
         let mut cards =
             merge_agent_logins(&Config::default(), Vec::new(), logins, &server.base_url());
@@ -1056,7 +1130,12 @@ mod tests {
             .map(|w| (w.label.as_str(), w.used_pct.round()))
             .collect();
         assert_eq!(shown, vec![("5h", 3.0), ("7d fable", 58.0)]);
-        assert_eq!(snap.source.as_deref(), Some("omp saved"));
+        assert_eq!(snap.source.as_deref(), Some("of…@example.com · omp saved"));
+        assert_eq!(
+            snap.plan.as_deref(),
+            Some("max"),
+            "no Claude Code: plan from the profile"
+        );
         assert!(snap.windows[0].resets_at.is_some());
         assert!(snap.note.unwrap().contains("rate limited"));
         drop(conn);
@@ -1143,7 +1222,9 @@ mod tests {
                 when.method(GET)
                     .path("/api/oauth/profile")
                     .header("authorization", format!("Bearer {token}"));
-                then.status(200).body(r#"{"account":{"uuid":"me"}}"#);
+                then.status(200).body(
+                    r#"{"account":{"uuid":"me","email":"user@example.com","has_claude_pro":true}}"#,
+                );
             });
         }
         let limited = server.mock(|when, then| {
@@ -1174,7 +1255,7 @@ mod tests {
 
         let snap = cards[0].poll().unwrap();
         assert_eq!(snap.windows.len(), 2, "omo's token answered");
-        assert_eq!(snap.source.as_deref(), Some("omo · live"));
+        assert_eq!(snap.source.as_deref(), Some("us…@example.com · omo · live"));
         assert_eq!(snap.note, None);
         assert_eq!(
             snap.plan.as_deref(),
