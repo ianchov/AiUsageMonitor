@@ -689,14 +689,21 @@ fn fetch_profile(api_base: &str, token: Zeroizing<String>) -> Option<Profile> {
     crate::accounts::with_deadline(PROFILE_LIMIT, call).flatten()
 }
 
-/// Shortens an email for display: "office@example.bg" → "of…@example.bg".
+/// Masks an email for display, keeping only enough to tell accounts apart:
+/// "office@example.bg" → "of…@ex….bg". The domain keeps its start and top-level part.
 pub fn mask_email(email: &str) -> String {
     let Some((local, domain)) = email.split_once('@') else {
         return "…".to_string();
     };
-    let keep = if local.chars().count() > 2 { 2 } else { 1 };
-    let head: String = local.chars().take(keep).collect();
-    format!("{head}…@{domain}")
+    let head = |part: &str| -> String {
+        let keep = if part.chars().count() > 2 { 2 } else { 1 };
+        part.chars().take(keep).collect()
+    };
+    let domain = match domain.rsplit_once('.') {
+        Some((name, tld)) => format!("{}….{tld}", head(name)),
+        None => format!("{}…", head(domain)),
+    };
+    format!("{}…@{domain}", head(local))
 }
 
 fn fetch_usage(api_base: &str, token: &str) -> Result<Vec<Window>, ProviderError> {
@@ -1074,10 +1081,11 @@ mod tests {
     }
 
     #[test]
-    fn mask_email_keeps_start_and_domain() {
-        assert_eq!(mask_email("office@example.bg"), "of…@example.bg");
-        assert_eq!(mask_email("ab@x.io"), "a…@x.io");
-        assert_eq!(mask_email("Ünïcode@x.io"), "Ün…@x.io");
+    fn mask_email_keeps_only_starts_and_top_level_domain() {
+        assert_eq!(mask_email("office@example.bg"), "of…@ex….bg");
+        assert_eq!(mask_email("ab@x.io"), "a…@x….io");
+        assert_eq!(mask_email("Ünïcode@mail.exämple.co.uk"), "Ün…@ma….uk");
+        assert_eq!(mask_email("root@localhost"), "ro…@lo…");
         assert_eq!(mask_email("not-an-email"), "…");
     }
 
@@ -1130,7 +1138,7 @@ mod tests {
             .map(|w| (w.label.as_str(), w.used_pct.round()))
             .collect();
         assert_eq!(shown, vec![("5h", 3.0), ("7d fable", 58.0)]);
-        assert_eq!(snap.source.as_deref(), Some("of…@example.com · omp saved"));
+        assert_eq!(snap.source.as_deref(), Some("of…@ex….com · omp saved"));
         assert_eq!(
             snap.plan.as_deref(),
             Some("max"),
@@ -1255,7 +1263,7 @@ mod tests {
 
         let snap = cards[0].poll().unwrap();
         assert_eq!(snap.windows.len(), 2, "omo's token answered");
-        assert_eq!(snap.source.as_deref(), Some("us…@example.com · omo · live"));
+        assert_eq!(snap.source.as_deref(), Some("us…@ex….com · omo · live"));
         assert_eq!(snap.note, None);
         assert_eq!(
             snap.plan.as_deref(),
