@@ -8,7 +8,8 @@ use crate::providers::copilot::Copilot;
 use crate::providers::cursor::Cursor;
 use crate::providers::minimax::MiniMax;
 use crate::providers::openai::{self, OpenAi};
-use crate::providers::Provider;
+use crate::providers::openrouter::OpenRouter;
+use crate::providers::{real_env, Provider};
 use std::path::Path;
 use std::time::Duration;
 
@@ -100,6 +101,9 @@ pub fn all_providers(cfg: &Config, paths: &Paths) -> Vec<Box<dyn Provider>> {
     if let Some(p) = MiniMax::detect(cfg, paths) {
         found.push(Box::new(p));
     }
+    if let Some(p) = OpenRouter::detect(cfg, real_env) {
+        found.push(Box::new(p));
+    }
     let rank = |id: &str| {
         let kind = id.split(':').next().unwrap_or(id);
         cfg.order
@@ -139,6 +143,7 @@ mod tests {
     fn cfg() -> Config {
         let mut cfg = Config::default();
         cfg.minimax.api_key_env = "AUM_TEST_UNSET_MINIMAX_KEY".into();
+        cfg.openrouter.api_key_env = "AUM_TEST_UNSET_OPENROUTER_KEY".into();
         // Copilot reads the real env/keychain; covered by its own tests.
         cfg.copilot.enabled = false;
         cfg

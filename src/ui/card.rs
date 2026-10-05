@@ -61,8 +61,15 @@ fn window_row(
 ) -> egui::Response {
     ui.horizontal(|ui| {
         row_label(ui, &window.label);
-        bar(ui, window.used_pct);
-        ui.monospace(format!("{:>5.1}%", window.used_pct));
+        if window.bar {
+            bar(ui, window.used_pct);
+        } else {
+            ui.allocate_exact_size(Vec2::new(BAR_WIDTH, BAR_HEIGHT), Sense::hover());
+        }
+        match &window.amount {
+            Some(amount) => ui.monospace(format!("{amount:>6}")),
+            None => ui.monospace(format!("{:>5.1}%", window.used_pct)),
+        };
         let reset = RichText::new(reset_text(window, now, mode))
             .monospace()
             .color(theme::MUTED);

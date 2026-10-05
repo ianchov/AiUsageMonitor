@@ -28,6 +28,7 @@ The monitor finds providers automatically by looking for the credentials their C
 - **GitHub Copilot** — uses the first GitHub login it finds: `COPILOT_GITHUB_TOKEN` / `GH_TOKEN` / `GITHUB_TOKEN`, the Copilot CLI entry (`copilot-cli`) in the OS keychain, copilot.vim/lua's `github-copilot/apps.json`, or the `gh` CLI login (`hosts.yml`, or its `gh:github.com` keychain entry). Classic `ghp_` tokens in the environment are skipped because Copilot does not accept them. A GitHub login without a Copilot subscription shows "no Copilot subscription"; set `[copilot] enabled = false` to hide the card. It calls GitHub's internal Copilot usage endpoint (`api.github.com/copilot_internal/user`) every 5 minutes.
 - **Cursor** — uses the `cursor-agent` login (`~/.config/cursor/auth.json`, Windows `%APPDATA%\Cursor\auth.json`, or `$CURSOR_CLI_AUTH_FILE`) or the Cursor app's local database (opened read-only), and calls Cursor's usage summary (`cursor.com/api/usage-summary`) every 5 minutes. Cursor logins expire; when that happens the card turns red until you open Cursor (or run `cursor-agent`) again.
 - **MiniMax** — uses `$MINIMAX_API_KEY` or the key stored by the `mmx` CLI in `~/.mmx/config.json`, and calls the Coding Plan endpoint (`api.minimax.io/v1/api/openplatform/coding_plan/remains`, or `api.minimaxi.com` for the `cn` region) every 120 s.
+- **OpenRouter** — uses `$OPENROUTER_API_KEY` (`[openrouter] api_key_env`) and calls `openrouter.ai/api/v1/key` every 5 minutes. The card shows the dollars the key spent today, this week and this month. These are calendar periods in UTC, as OpenRouter counts them (the week starts on Monday), not rolling 1, 7 and 30 days. Each row's reset time is the end of its period. Without a credit limit there are no bars. With a limit, the period the limit resets on gets a bar for its share of the limit (a limit that never resets adds a "total" row), and the note shows what is left.
 
 The Copilot and Cursor endpoints are internal to those services and may change without notice.
 
@@ -77,7 +78,7 @@ Every key is optional (see `config.example.toml`):
 
 ```toml
 always_on_top = false
-order = ["claude", "openai", "copilot", "cursor", "minimax"]
+order = ["claude", "openai", "copilot", "cursor", "minimax", "openrouter"]
 
 [claude]
 enabled = true
@@ -106,6 +107,10 @@ enabled = true
 api_key_env = "MINIMAX_API_KEY"
 # region = "global"      # or "cn"
 models = ["general"]      # add "video" etc. to show more MiniMax quotas
+
+[openrouter]
+enabled = true
+api_key_env = "OPENROUTER_API_KEY"
 ```
 
 On Windows write folder paths with forward slashes (`"D:/other/.claude"`) or in single quotes (`'D:\other\.claude'`); backslashes inside double quotes make the file invalid. An `[[...accounts]]` entry pointing at a folder that was already found automatically just renames it. API keys are never read from this file — only from an environment variable or the CLI's own credential file. Unknown keys are reported in the log and ignored; an invalid file falls back to defaults. Right-click the window for always-on-top, the time format toggle and a shortcut to the config folder.

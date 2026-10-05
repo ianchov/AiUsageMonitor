@@ -18,6 +18,7 @@ pub struct Config {
     pub copilot: CopilotConfig,
     pub cursor: CursorConfig,
     pub minimax: MiniMaxConfig,
+    pub openrouter: OpenRouterConfig,
 }
 
 impl Default for Config {
@@ -30,12 +31,14 @@ impl Default for Config {
                 "copilot".into(),
                 "cursor".into(),
                 "minimax".into(),
+                "openrouter".into(),
             ],
             claude: ClaudeConfig::default(),
             openai: OpenAiConfig::default(),
             copilot: CopilotConfig::default(),
             cursor: CursorConfig::default(),
             minimax: MiniMaxConfig::default(),
+            openrouter: OpenRouterConfig::default(),
         }
     }
 }
@@ -106,6 +109,23 @@ impl Default for MiniMaxConfig {
             api_key_env: "MINIMAX_API_KEY".into(),
             region: None,
             models: vec!["general".into()],
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct OpenRouterConfig {
+    pub enabled: bool,
+    /// Environment variable that holds the OpenRouter API key.
+    pub api_key_env: String,
+}
+
+impl Default for OpenRouterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            api_key_env: "OPENROUTER_API_KEY".into(),
         }
     }
 }
@@ -202,7 +222,14 @@ mod tests {
         assert!(ignored.is_empty());
         assert_eq!(
             cfg.order,
-            vec!["claude", "openai", "copilot", "cursor", "minimax"]
+            vec![
+                "claude",
+                "openai",
+                "copilot",
+                "cursor",
+                "minimax",
+                "openrouter"
+            ]
         );
         assert!(cfg.copilot.enabled && cfg.cursor.enabled);
         assert!(cfg.claude.enabled && cfg.openai.enabled && cfg.minimax.enabled);

@@ -3,7 +3,7 @@
 # Windows: %APPDATA%\ai-usage-monitor\config.toml
 
 always_on_top = false
-order = ["claude", "openai", "copilot", "cursor", "minimax"]
+order = ["claude", "openai", "copilot", "cursor", "minimax", "openrouter"]
 
 [claude]
 enabled = true
@@ -35,3 +35,7 @@ enabled = true
 api_key_env = "MINIMAX_API_KEY"
 # region = "global"      # or "cn"
 models = ["general"]
+
+[openrouter]
+enabled = true
+api_key_env = "OPENROUTER_API_KEY"
