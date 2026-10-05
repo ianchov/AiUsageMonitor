@@ -14,6 +14,38 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use zeroize::Zeroizing;
 
+/// Claude Code's credentials for one config folder: `.credentials.json`, or on macOS
+/// the login keychain item Claude Code writes instead of that file.
+pub fn read_credentials(dir: &Path) -> Option<Zeroizing<String>> {
+    read_secret_file(&dir.join(".credentials.json")).or_else(|| keychain_credentials(dir))
+}
+
+#[cfg(target_os = "macos")]
+fn keychain_credentials(dir: &Path) -> Option<Zeroizing<String>> {
+    let home = dirs::home_dir()?;
+    crate::keychain::lookup(&keychain_service(dir, &home))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn keychain_credentials(_dir: &Path) -> Option<Zeroizing<String>> {
+    None
+}
+
+/// Keychain service Claude Code uses for `dir`: plain for `~/.claude`, otherwise
+/// suffixed with the first 8 hex digits of SHA-256 of the folder path
+/// (the value of `CLAUDE_CONFIG_DIR`).
+#[cfg(target_os = "macos")]
+fn keychain_service(dir: &Path, home: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    const SERVICE: &str = "Claude Code-credentials";
+    if dir == home.join(".claude") {
+        return SERVICE.to_string();
+    }
+    let hash = Sha256::digest(dir.to_string_lossy().as_bytes());
+    let hex: String = hash[..4].iter().map(|b| format!("{b:02x}")).collect();
+    format!("{SERVICE}-{hex}")
+}
+
 pub const API_BASE: &str = "https://api.anthropic.com";
 
 const DEFAULT_CONTEXT: u64 = 200_000;
@@ -190,7 +222,7 @@ impl Claude {
         if !cfg.claude.enabled {
             return None;
         }
-        let creds = read_secret_file(&account.dir.join(".credentials.json"))?;
+        let creds = read_credentials(&account.dir)?;
         parse_credentials(&creds)?;
         let (id, name) = account.identity("claude", "Claude");
         let interval = cfg.claude.poll_interval();
@@ -312,8 +344,7 @@ impl Provider for Claude {
     }
 
     fn poll(&mut self) -> Result<ProviderSnapshot, ProviderError> {
-        let creds = read_secret_file(&self.claude_dir.join(".credentials.json"))
-            .ok_or(ProviderError::NoCredentials)?;
+        let creds = read_credentials(&self.claude_dir).ok_or(ProviderError::NoCredentials)?;
         let (token, plan) = parse_credentials(&creds).ok_or(ProviderError::NoCredentials)?;
         let now = SystemTime::now();
         let usage = self.usage(&token, now);

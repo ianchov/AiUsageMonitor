@@ -9,12 +9,13 @@ pub const LOOKUP_LIMIT: std::time::Duration = std::time::Duration::from_secs(2);
 pub type KeychainFn = fn(&'static str) -> Option<Zeroizing<String>>;
 
 /// Secret another app saved under `service` (e.g. `copilot-cli`, `gh:github.com`), bounded by [`LOOKUP_LIMIT`].
-pub fn lookup(service: &'static str) -> Option<Zeroizing<String>> {
-    crate::accounts::with_deadline(LOOKUP_LIMIT, move || find(service)).flatten()
+pub fn lookup(service: &str) -> Option<Zeroizing<String>> {
+    let service = service.to_owned();
+    crate::accounts::with_deadline(LOOKUP_LIMIT, move || find(&service)).flatten()
 }
 
 #[cfg(target_os = "linux")]
-fn find(service: &'static str) -> Option<Zeroizing<String>> {
+fn find(service: &str) -> Option<Zeroizing<String>> {
     use dbus_secret_service::{EncryptionType, SecretService};
     let ss = SecretService::connect(EncryptionType::Dh).ok()?;
     let found = ss
@@ -27,7 +28,7 @@ fn find(service: &'static str) -> Option<Zeroizing<String>> {
 }
 
 #[cfg(windows)]
-fn find(service: &'static str) -> Option<Zeroizing<String>> {
+fn find(service: &str) -> Option<Zeroizing<String>> {
     use windows_sys::Win32::Security::Credentials::{CredEnumerateW, CredFree, CREDENTIALW};
     let filter: Vec<u16> = format!("{service}*")
         .encode_utf16()
@@ -59,8 +60,25 @@ fn find(service: &'static str) -> Option<Zeroizing<String>> {
     token
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
-fn find(_service: &'static str) -> Option<Zeroizing<String>> {
+#[cfg(target_os = "macos")]
+fn find(service: &str) -> Option<Zeroizing<String>> {
+    // `security` is the tool Claude Code and gh use to store these items, so the item's
+    // access list already trusts it and no password prompt appears.
+    let out = std::process::Command::new("/usr/bin/security")
+        .args(["find-generic-password", "-s", service, "-w"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let secret = Zeroizing::new(out.stdout);
+    if !out.status.success() {
+        return None;
+    }
+    crate::providers::decode_secret(&secret)
+}
+
+#[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
+fn find(_service: &str) -> Option<Zeroizing<String>> {
     None
 }
 

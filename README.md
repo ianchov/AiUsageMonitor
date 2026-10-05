@@ -2,7 +2,7 @@
 
 **Version 2.0.2**
 
-A small native desktop app for **Windows and Linux** that shows how much of your AI subscription you have used, at a glance. It supports **Claude** (Claude Code), **OpenAI** (ChatGPT plan used through the Codex CLI), **GitHub Copilot**, **Cursor** and **MiniMax** (Coding Plan), and is built so more providers can be added with one source file each.
+A small native desktop app for **Windows, Linux and macOS** that shows how much of your AI subscription you have used, at a glance. It supports **Claude** (Claude Code), **OpenAI** (ChatGPT plan used through the Codex CLI), **GitHub Copilot**, **Cursor** and **MiniMax** (Coding Plan), and is built so more providers can be added with one source file each.
 
 One window, one card per provider (and one per account if you use several Claude or Codex logins), each with its rate-limit windows, a usage bar and a reset countdown.
 
@@ -22,7 +22,7 @@ Bars turn amber at 60 % and red at 85 %. Click a reset time to switch between a 
 
 The monitor finds providers automatically by looking for the credentials their CLIs already store. It only **reads** those files; it never writes to them and never stores its own copy.
 
-- **Claude** — reads the OAuth token from `~/.claude/.credentials.json` (or `$CLAUDE_CONFIG_DIR`) and calls Anthropic's usage endpoint (`api.anthropic.com/api/oauth/usage`) every 120 s (`[claude] poll_seconds`, at least 60). Claude Code uses the same endpoint with the same token, so polling too often gets it rate-limited. The last reading is kept in the cache folder (`~/.cache/ai-usage-monitor`, Windows `%LOCALAPPDATA%\ai-usage-monitor`) so a restart shows it at once. The session block is computed from the newest Claude Code log under `~/.claude/projects/`. Only token counts, model and effort are read; conversation content is ignored.
+- **Claude** — reads the OAuth token from `~/.claude/.credentials.json` (or `$CLAUDE_CONFIG_DIR`) and calls Anthropic's usage endpoint (`api.anthropic.com/api/oauth/usage`) every 120 s (`[claude] poll_seconds`, at least 60). On macOS, Claude Code keeps the token in the login keychain instead of that file: the monitor reads the `Claude Code-credentials` item for `~/.claude`, and `Claude Code-credentials-<hash>` for other folders (first 8 hex digits of SHA-256 of the folder path). Only Pro/Max logins (`claudeAiOauth`) have usage data; API-key logins show no card. Claude Code uses the same endpoint with the same token, so polling too often gets it rate-limited. The last reading is kept in the cache folder (`~/.cache/ai-usage-monitor`, Windows `%LOCALAPPDATA%\ai-usage-monitor`, macOS `~/Library/Caches/ai-usage-monitor`) so a restart shows it at once. The session block is computed from the newest Claude Code log under `~/.claude/projects/`. Only token counts, model and effort are read; conversation content is ignored.
 - **OpenAI** — reads the ChatGPT token from `~/.codex/auth.json` (or `$CODEX_HOME`) and calls the ChatGPT usage endpoint (`chatgpt.com/backend-api/wham/usage`) every 60 s. If that fails, it falls back to the rate limits Codex last wrote into its session logs under `~/.codex/sessions/` and marks the card "as of HH:MM (local)".
 - **GitHub Copilot** — uses the first GitHub login it finds: `COPILOT_GITHUB_TOKEN` / `GH_TOKEN` / `GITHUB_TOKEN`, the Copilot CLI entry (`copilot-cli`) in the OS keychain, copilot.vim/lua's `github-copilot/apps.json`, or the `gh` CLI login (`hosts.yml`, or its `gh:github.com` keychain entry). Classic `ghp_` tokens in the environment are skipped because Copilot does not accept them. A GitHub login without a Copilot subscription shows "no Copilot subscription"; set `[copilot] enabled = false` to hide the card. It calls GitHub's internal Copilot usage endpoint (`api.github.com/copilot_internal/user`) every 5 minutes.
 - **Cursor** — uses the `cursor-agent` login (`~/.config/cursor/auth.json`, Windows `%APPDATA%\Cursor\auth.json`, or `$CURSOR_CLI_AUTH_FILE`) or the Cursor app's local database (opened read-only), and calls Cursor's usage summary (`cursor.com/api/usage-summary`) every 5 minutes. Cursor logins expire; when that happens the card turns red until you open Cursor (or run `cursor-agent`) again.
@@ -55,12 +55,22 @@ mkdir -p ~/.config/autostart
 cp ~/.local/share/applications/ai-usage-monitor.desktop ~/.config/autostart/
 ```
 
+**macOS:** there is no prebuilt release. Build from source (see *Building from source*), then:
+
+```sh
+mkdir -p ~/.local/bin
+install -m755 target/release/ai-usage-monitor ~/.local/bin/ai-usage-monitor
+```
+
+Run it from a terminal with `ai-usage-monitor`. To start it on login, add it under System Settings → General → Login Items.
+
 ## Configuration
 
 No configuration is needed. To change behaviour, create `config.toml` at:
 
 - Linux: `~/.config/ai-usage-monitor/config.toml`
 - Windows: `%APPDATA%\ai-usage-monitor\config.toml`
+- macOS: `~/Library/Application Support/ai-usage-monitor/config.toml`
 
 Every key is optional (see `config.example.toml`):
 
@@ -106,7 +116,7 @@ On Windows write folder paths with forward slashes (`"D:/other/.claude"`) or in 
 - Logs (enable with `RUST_LOG`) contain only provider names, HTTP status codes and error kinds.
 - All provider requests use HTTPS with a 15 s timeout; responses are capped at 2 MB.
 - Conversation contents are never read for display or sent anywhere.
-- For GitHub Copilot the app reads the `copilot-cli` and `gh:github.com` entries from the OS keychain (Secret Service on Linux, Credential Manager on Windows). A locked keychain is skipped; the app never asks you to unlock it.
+- For GitHub Copilot the app reads the `copilot-cli` and `gh:github.com` entries from the OS keychain (Secret Service on Linux, Credential Manager on Windows, login keychain on macOS). On macOS it also reads Claude Code's `Claude Code-credentials` items. A locked keychain is skipped; the app never asks you to unlock it. On macOS it uses `/usr/bin/security`, the tool Claude Code and `gh` store their items with, so no access prompt appears.
 - For Cursor the app opens Cursor's local settings database read-only and never modifies it.
 
 ## Building from source
@@ -122,6 +132,8 @@ On Linux, install the GUI development packages first (Debian/Ubuntu names):
 ```sh
 sudo apt-get install libxkbcommon-dev libgl1-mesa-dev libwayland-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev
 ```
+
+On macOS, install the Xcode Command Line Tools (`xcode-select --install`) and Rust (`brew install rust` or rustup). No other packages are needed.
 
 Run the tests with `cargo test`.
 

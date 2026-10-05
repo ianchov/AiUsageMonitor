@@ -8,7 +8,7 @@ use crate::providers::copilot::Copilot;
 use crate::providers::cursor::Cursor;
 use crate::providers::minimax::MiniMax;
 use crate::providers::openai::{self, OpenAi};
-use crate::providers::Provider;
+use crate::providers::{read_secret_file, Provider};
 use std::path::Path;
 use std::time::Duration;
 
@@ -24,12 +24,12 @@ fn codex_valid(text: &str) -> bool {
 }
 
 const CLAUDE_RULES: Rules<'static> = Rules {
-    cred_file: ".credentials.json",
+    read: claude::read_credentials,
     is_valid: claude_valid,
     strip: "claude",
 };
 const CODEX_RULES: Rules<'static> = Rules {
-    cred_file: "auth.json",
+    read: |dir| read_secret_file(&dir.join("auth.json")),
     is_valid: codex_valid,
     strip: "codex",
 };
