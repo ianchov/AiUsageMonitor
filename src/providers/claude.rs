@@ -690,7 +690,7 @@ fn fetch_profile(api_base: &str, token: Zeroizing<String>) -> Option<Profile> {
 }
 
 /// Masks an email for display, keeping only enough to tell accounts apart:
-/// "office@example.bg" → "of…@ex….bg". The domain keeps its start and top-level part.
+/// "office@example.com" → "of…@ex….com". The domain keeps its start and top-level part.
 pub fn mask_email(email: &str) -> String {
     let Some((local, domain)) = email.split_once('@') else {
         return "…".to_string();
